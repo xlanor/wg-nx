@@ -1,0 +1,10 @@
+build/
+*.a
+*.o
+*.d
+*.elf
+*.nro
+*.nacp
+test/test_crypto
+test/test_demo_server
+wg-tester/build/

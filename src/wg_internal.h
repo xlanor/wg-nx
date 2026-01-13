@@ -1,0 +1,141 @@
+#ifndef WG_INTERNAL_H
+#define WG_INTERNAL_H
+
+#include "wireguard.h"
+#include "wg_thread.h"
+#include "monocypher.h"
+#include <stdbool.h>
+
+#define WG_CONSTRUCTION "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+#define WG_IDENTIFIER "WireGuard v1 zx2c4 Jason@zx2c4.com"
+#define WG_LABEL_MAC1 "mac1----"
+#define WG_LABEL_COOKIE "cookie--"
+
+#define WG_HASH_LEN 32
+#define WG_AEAD_TAG_LEN 16
+#define WG_TIMESTAMP_LEN 12
+#define WG_COOKIE_LEN 16
+#define WG_MAC_LEN 16
+
+#define WG_REKEY_AFTER_MESSAGES ((uint64_t)1 << 60)
+#define WG_REJECT_AFTER_MESSAGES ((uint64_t)1 << 64 - (uint64_t)1 << 13 - 1)
+#define WG_REKEY_AFTER_TIME 120
+#define WG_REJECT_AFTER_TIME 180
+#define WG_REKEY_TIMEOUT 5
+#define WG_KEEPALIVE_TIMEOUT 10
+
+typedef enum {
+    WG_MSG_HANDSHAKE_INIT = 1,
+    WG_MSG_HANDSHAKE_RESPONSE = 2,
+    WG_MSG_COOKIE_REPLY = 3,
+    WG_MSG_TRANSPORT = 4,
+} WgMsgType;
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t reserved[3];
+    uint32_t sender_index;
+    uint8_t ephemeral[WG_KEY_LEN];
+    uint8_t encrypted_static[WG_KEY_LEN + WG_AEAD_TAG_LEN];
+    uint8_t encrypted_timestamp[WG_TIMESTAMP_LEN + WG_AEAD_TAG_LEN];
+    uint8_t mac1[WG_MAC_LEN];
+    uint8_t mac2[WG_MAC_LEN];
+} WgHandshakeInit;
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t reserved[3];
+    uint32_t sender_index;
+    uint32_t receiver_index;
+    uint8_t ephemeral[WG_KEY_LEN];
+    uint8_t encrypted_nothing[WG_AEAD_TAG_LEN];
+    uint8_t mac1[WG_MAC_LEN];
+    uint8_t mac2[WG_MAC_LEN];
+} WgHandshakeResponse;
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t reserved[3];
+    uint32_t receiver_index;
+    uint64_t counter;
+    uint8_t encrypted_data[];
+} WgTransport;
+
+typedef struct {
+    uint8_t hash[WG_HASH_LEN];
+    uint8_t chaining_key[WG_HASH_LEN];
+    uint8_t ephemeral_private[WG_KEY_LEN];
+} WgHandshakeState;
+
+typedef struct {
+    uint8_t sending_key[WG_KEY_LEN];
+    uint8_t receiving_key[WG_KEY_LEN];
+    uint64_t sending_counter;
+    uint64_t receiving_counter;
+    uint32_t local_index;
+    uint32_t old_local_index;
+    uint32_t remote_index;
+    uint64_t last_handshake;
+    uint64_t last_received;
+    bool valid;
+    bool rekey_in_progress;
+} WgSession;
+
+struct WgTunnel {
+    uint8_t static_private[WG_KEY_LEN];
+    uint8_t static_public[WG_KEY_LEN];
+    uint8_t peer_public[WG_KEY_LEN];
+    uint8_t preshared_key[WG_KEY_LEN];
+    bool has_psk;
+    struct in_addr tunnel_ip;
+    struct sockaddr_in endpoint;
+    uint16_t keepalive_interval;
+    int socket_fd;
+    WgSession session;
+    uint8_t cookie[WG_COOKIE_LEN];
+    bool has_cookie;
+    uint64_t cookie_timestamp;
+    uint8_t last_initiation_hash[WG_HASH_LEN];
+
+    WgThread recv_thread;
+    WgThread keepalive_thread;
+    WgStopCond stop_cond;
+    WgMutex send_mutex;
+    WgRecvCallback recv_cb;
+    void* recv_cb_user;
+    bool running;
+
+    uint8_t pending_response[256];
+    int pending_response_len;
+};
+
+void wg_hash(uint8_t out[WG_HASH_LEN], const void* data, size_t len);
+void wg_hash2(uint8_t out[WG_HASH_LEN], const void* a, size_t a_len, const void* b, size_t b_len);
+void wg_mac(uint8_t out[WG_MAC_LEN], const uint8_t* key, size_t key_len, const void* data, size_t len);
+void wg_hmac(uint8_t* out, size_t out_len, const uint8_t* key, size_t key_len, const void* data, size_t data_len);
+void wg_kdf1(uint8_t out[WG_HASH_LEN], const uint8_t key[WG_HASH_LEN], const void* input, size_t input_len);
+void wg_kdf2(uint8_t out1[WG_HASH_LEN], uint8_t out2[WG_HASH_LEN], const uint8_t key[WG_HASH_LEN], const void* input, size_t input_len);
+void wg_kdf3(uint8_t out1[WG_HASH_LEN], uint8_t out2[WG_HASH_LEN], uint8_t out3[WG_HASH_LEN], const uint8_t key[WG_HASH_LEN], const void* input, size_t input_len);
+void wg_mix_hash(WgHandshakeState* state, const void* data, size_t len);
+void wg_mix_key(WgHandshakeState* state, const void* input, size_t len);
+int wg_aead_encrypt(uint8_t* out, const uint8_t key[WG_KEY_LEN], uint64_t counter, const void* plaintext, size_t plaintext_len, const void* ad, size_t ad_len);
+int wg_aead_decrypt(uint8_t* out, const uint8_t key[WG_KEY_LEN], uint64_t counter, const void* ciphertext, size_t ciphertext_len, const void* ad, size_t ad_len);
+
+void wg_timestamp(uint8_t out[WG_TIMESTAMP_LEN]);
+uint64_t wg_time_now(void);
+void wg_sleep_ms(int ms);
+
+int wg_handshake_init(WgTunnel* tun, WgHandshakeInit* msg, WgHandshakeState* state);
+int wg_handshake_response(WgTunnel* tun, const WgHandshakeResponse* msg, WgHandshakeState* state);
+
+int wg_socket_open(WgTunnel* tun);
+int wg_socket_send(WgTunnel* tun, const void* data, size_t len);
+int wg_socket_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms);
+void wg_socket_close(WgTunnel* tun);
+
+uint32_t wg_random_index(void);
+int wg_resolve_endpoint(WgTunnel* tun, const char* host, uint16_t port);
+
+void wg_log(const char* fmt, ...);
+
+#endif
