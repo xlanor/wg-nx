@@ -403,12 +403,9 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
     if (packet_size > WG_MAX_PACKET_SIZE)
         return WG_ERR_BUFFER_TOO_SMALL;
 
-    uint8_t* packet = malloc(packet_size);
-    if (!packet)
-        return WG_ERR_SOCKET;
-
     wg_mutex_lock(&tun->send_mutex);
 
+    uint8_t* packet = tun->send_buffer;
     WgTransport* transport = (WgTransport*)packet;
     transport->type = WG_MSG_TRANSPORT;
     memset(transport->reserved, 0, sizeof(transport->reserved));
@@ -420,8 +417,6 @@ int wg_send(WgTunnel* tun, const void* data, size_t len) {
     int sent = wg_socket_send(tun, packet, packet_size);
 
     wg_mutex_unlock(&tun->send_mutex);
-
-    free(packet);
 
     if (sent < 0)
         return WG_ERR_SOCKET;

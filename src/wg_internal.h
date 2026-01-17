@@ -101,6 +101,7 @@ struct WgTunnel {
     WgThread keepalive_thread;
     WgStopCond stop_cond;
     WgMutex send_mutex;
+    uint8_t send_buffer[2048];
     WgRecvCallback recv_cb;
     void* recv_cb_user;
     bool running;
