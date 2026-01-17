@@ -20,15 +20,14 @@ void wg_set_log_callback(void (*func)(const char* msg)) {
 }
 
 void wg_log(const char* fmt, ...) {
+    if (!wg_log_func)
+        return;
     char buf[256];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    /* Always print to stdout for thread-safe debugging */
-    printf("[WG] %s\n", buf);
-    fflush(stdout);
-    if (wg_log_func) wg_log_func(buf);
+    wg_log_func(buf);
 }
 
 uint32_t wg_random_index(void);
