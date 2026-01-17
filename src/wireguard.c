@@ -9,7 +9,6 @@
 #define WG_HANDSHAKE_TIMEOUT_MS 5000
 
 static uint8_t g_recv_packet[WG_MAX_PACKET_SIZE];
-static uint8_t g_recv_plaintext[WG_MAX_PACKET_SIZE];
 
 #define WG_KEEPALIVE_DEFAULT 25
 #define WG_REKEY_CHECK_INTERVAL_MS 10000
@@ -238,7 +237,6 @@ static bool wg_needs_rekey(WgTunnel* tun) {
 static void* recv_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
     uint8_t* packet = g_recv_packet;
-    uint8_t* plaintext = g_recv_plaintext;
     uint64_t total_recv = 0;
     uint64_t last_log = 0;
 
@@ -298,7 +296,7 @@ static void* recv_thread_func(void* arg) {
             continue;
         }
 
-        int err = wg_aead_decrypt(plaintext, tun->session.receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
+        int err = wg_aead_decrypt(transport->encrypted_data, tun->session.receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
         if (err != 0) {
             wg_log("recv: decrypt failed (ctr=%llu)", (unsigned long long)transport->counter);
             continue;
@@ -308,7 +306,7 @@ static void* recv_thread_func(void* arg) {
         tun->session.receiving_counter = transport->counter + 1;
 
         if (tun->recv_cb)
-            tun->recv_cb(tun->recv_cb_user, plaintext, plaintext_len);
+            tun->recv_cb(tun->recv_cb_user, transport->encrypted_data, plaintext_len);
     }
 
     wg_log("recv thread exiting, total=%llu", (unsigned long long)total_recv);
