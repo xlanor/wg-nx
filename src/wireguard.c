@@ -235,6 +235,7 @@ static bool wg_needs_rekey(WgTunnel* tun) {
 
 static void* recv_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
+    wg_thread_set_affinity(WG_THREAD_NAME_RECV);
     uint8_t* packet = g_recv_packet;
     uint64_t total_recv = 0;
     uint64_t last_log = 0;
@@ -314,6 +315,7 @@ static void* recv_thread_func(void* arg) {
 
 static void* keepalive_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
+    wg_thread_set_affinity(WG_THREAD_NAME_SEND);
     uint64_t keepalive_interval_ms = tun->keepalive_interval * 1000;
     uint64_t check_interval_ms = keepalive_interval_ms < WG_REKEY_CHECK_INTERVAL_MS
         ? keepalive_interval_ms

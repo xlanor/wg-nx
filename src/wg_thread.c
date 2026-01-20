@@ -1,11 +1,9 @@
 #define _GNU_SOURCE
 
 #include "wg_thread.h"
+#include <switch.h>
 #include <errno.h>
 #include <time.h>
-
-#ifdef __SWITCH__
-#include <switch.h>
 
 static int64_t wg_get_thread_limit(void) {
     uint64_t resource_limit_handle = INVALID_HANDLE;
@@ -15,13 +13,13 @@ static int64_t wg_get_thread_limit(void) {
     svcGetResourceLimitLimitValue(&thread_lim, resource_limit_handle, LimitableResource_Threads);
     return thread_lim - thread_cur;
 }
-#endif
+
+static WgThreadAffinityFunc g_wg_affinity_cb = NULL;
+static void *g_wg_affinity_cb_user = NULL;
 
 int wg_thread_create(WgThread *thread, WgThreadFunc func, void *arg) {
-#ifdef __SWITCH__
     if (wg_get_thread_limit() <= 1)
         return -1;
-#endif
     int r = pthread_create(&thread->thread, NULL, func, arg);
     return r == 0 ? 0 : -1;
 }
@@ -32,14 +30,19 @@ int wg_thread_join(WgThread *thread, void **retval) {
 }
 
 int wg_thread_set_name(WgThread *thread, const char *name) {
-#ifdef __GLIBC__
-    int r = pthread_setname_np(thread->thread, name);
-    return r == 0 ? 0 : -1;
-#else
     (void)thread;
     (void)name;
     return 0;
-#endif
+}
+
+void wg_thread_set_affinity(WgThreadName name) {
+    if (g_wg_affinity_cb)
+        g_wg_affinity_cb(name, g_wg_affinity_cb_user);
+}
+
+void wg_thread_set_affinity_cb(WgThreadAffinityFunc func, void *user) {
+    g_wg_affinity_cb = func;
+    g_wg_affinity_cb_user = user;
 }
 
 int wg_mutex_init(WgMutex *mutex, bool recursive) {

@@ -35,6 +35,7 @@ static void relay_recv_callback(void* user, const void* data, size_t len) {
 
 static void* relay_thread_func(void* arg) {
     WgRelay* relay = (WgRelay*)arg;
+    wg_thread_set_affinity(WG_THREAD_NAME_RELAY);
     uint8_t buf[RELAY_MAX_PACKET];
     struct sockaddr_in from_addr;
     socklen_t from_len;
