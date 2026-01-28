@@ -24,14 +24,46 @@ if (PLATFORM_SWITCH)
     list(APPEND MAIN_SRC ${BOREALIS_LIBRARY}/lib/platforms/switch/switch_wrapper.c)
 endif()
 
+set(LWIP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../library/lwip)
+
+set(LWIP_SRCS
+    ${LWIP_DIR}/src/core/init.c
+    ${LWIP_DIR}/src/core/def.c
+    ${LWIP_DIR}/src/core/inet_chksum.c
+    ${LWIP_DIR}/src/core/ip.c
+    ${LWIP_DIR}/src/core/mem.c
+    ${LWIP_DIR}/src/core/memp.c
+    ${LWIP_DIR}/src/core/netif.c
+    ${LWIP_DIR}/src/core/pbuf.c
+    ${LWIP_DIR}/src/core/tcp.c
+    ${LWIP_DIR}/src/core/tcp_in.c
+    ${LWIP_DIR}/src/core/tcp_out.c
+    ${LWIP_DIR}/src/core/timeouts.c
+    ${LWIP_DIR}/src/core/udp.c
+    ${LWIP_DIR}/src/core/ipv4/ip4.c
+    ${LWIP_DIR}/src/core/ipv4/ip4_addr.c
+    ${LWIP_DIR}/src/core/ipv4/ip4_frag.c
+    ${LWIP_DIR}/src/core/ipv4/icmp.c
+)
+
+set(LWIP_RELAY_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../lwip-relay/src/wg_lwip_relay.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../lwip-relay/src/wg_netif.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../lwip-relay/src/sys_arch.c
+)
+
 program_target(${PROJECT_NAME} "${MAIN_SRC}")
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 17)
+
+target_sources(${PROJECT_NAME} PRIVATE ${LWIP_SRCS} ${LWIP_RELAY_SRCS})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../library/crypto
+    ${CMAKE_CURRENT_SOURCE_DIR}/../lwip-relay/include
+    ${LWIP_DIR}/src/include
     ${APP_PLATFORM_INCLUDE}
 )
 

@@ -4,3 +4,6 @@
 [submodule "library/libsodium"]
 	path = library/libsodium
 	url = https://github.com/jedisct1/libsodium.git
+[submodule "library/lwip"]
+	path = library/lwip
+	url = https://github.com/lwip-tcpip/lwip.git

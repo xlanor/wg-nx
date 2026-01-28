@@ -17,6 +17,8 @@ extern "C" {
 #include "wg_poly1305_neon.h"
 }
 
+#include "wg_lwip_relay.hpp"
+
 #define DEMO_HOST "demo.wireguard.com"
 #define DEMO_TCP_PORT 42912
 
@@ -283,6 +285,60 @@ static void test_relay() {
     if (tun) wg_close(tun);
 
     results.push_back({"Relay Create", ok});
+}
+
+static void test_lwip_relay() {
+    uint8_t priv[32], pub[32], peer_pub[32];
+    wg_generate_keypair(priv, pub);
+    wg_generate_keypair(peer_pub, peer_pub);
+
+    WgConfig config = {};
+    memcpy(config.private_key, priv, 32);
+    memcpy(config.peer_public_key, peer_pub, 32);
+    config.tunnel_ip.s_addr = inet_addr("10.0.0.2");
+    strncpy(config.endpoint_host, "127.0.0.1", sizeof(config.endpoint_host));
+    config.endpoint_port = 51820;
+    config.keepalive_interval = 25;
+    config.has_preshared_key = 0;
+
+    WgTunnel* tun = wg_init(&config);
+    bool ok = tun != nullptr;
+
+    wgnx::LwipRelay* relay = nullptr;
+    if (ok) {
+        wgnx::LwipRelayConfig relayConfig;
+        relayConfig.log_callback = [](wgnx::LogLevel level, const char* msg) {
+            if (level == wgnx::LogLevel::Error) {
+                brls::Logger::error("[LwipRelay] {}", msg);
+            } else {
+                brls::Logger::info("[LwipRelay] {}", msg);
+            }
+        };
+        relayConfig.debug_logging = false;
+
+        relay = new wgnx::LwipRelay(tun, relayConfig);
+        ok = relay != nullptr;
+    }
+
+    if (ok && relay) {
+        ok = relay->start("10.0.0.2", "10.0.0.1");
+    }
+
+    uint16_t tcpPort = 0;
+    uint16_t udpPort = 0;
+    if (ok && relay) {
+        tcpPort = relay->startTcpRelay(9295, 9295);
+        udpPort = relay->startUdpRelay(9296, 9296);
+        ok = (tcpPort == 9295) && (udpPort == 9296);
+    }
+
+    if (relay) {
+        relay->stop();
+        delete relay;
+    }
+    if (tun) wg_close(tun);
+
+    results.push_back({"LwipRelay Create", ok});
 }
 
 static bool get_demo_config(uint8_t* server_pub, uint16_t* udp_port, char* my_ip, const char* my_pub_b64) {
@@ -738,6 +794,7 @@ static void run_all_tests() {
     test_thread_create();
     test_wg_init();
     test_relay();
+    test_lwip_relay();
     test_udp_send();
     test_rekey_integration();
 }
