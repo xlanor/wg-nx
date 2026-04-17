@@ -272,11 +272,16 @@ int LwipRelay::handleIncomingPacket(WgRecvSlot* slot, const void* data, size_t l
     if (!running_ || !slot || !data || len == 0) {
         return 0;
     }
+    /* Only wake if the queue was empty. Otherwise the lwIP thread is either
+     * already processing or will pick this up on its next drain — saves a
+     * write/read syscall pair per packet during bursts. */
+    bool was_empty;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
+        was_empty = incomingQueue_.empty();
         incomingQueue_.push({slot, static_cast<const uint8_t*>(data), len});
     }
-    signalWake();
+    if (was_empty) signalWake();
     return 1;
 }
 
@@ -325,9 +330,10 @@ void LwipRelay::runLoop() {
     log(LogLevel::Info, "LwipRelay: loop started");
 
     /* Event-driven: block in a single poll() watching the wake pipe and all
-     * managed sockets. The 50ms timeout bounds lwIP timer accuracy, which is
-     * well within TCP's 500ms retransmit floor. */
-    constexpr int kPollTimeoutMs = 50;
+     * managed sockets. The 200ms timeout bounds lwIP timer accuracy, still
+     * well within TCP's 500ms retransmit floor, and halves idle wake-up
+     * syscalls vs the previous 50ms. */
+    constexpr int kPollTimeoutMs = 200;
 
     while (running_) {
         pollFds_.clear();
