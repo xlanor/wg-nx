@@ -281,13 +281,22 @@ int LwipRelay::handleIncomingPacket(WgRecvSlot* slot, const void* data, size_t l
 }
 
 void LwipRelay::processIncomingQueue() {
+    /* Cap per-iteration drain so downstream consumers (e.g. the chiaki video
+     * decoder) get packets in small batches rather than one huge burst.
+     * If more remain, we re-arm the wake so the loop comes right back. */
+    constexpr size_t kMaxPerIteration = 16;
+
     std::vector<IncomingSlot> packets;
+    bool more = false;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        while (!incomingQueue_.empty()) {
+        size_t n = std::min(incomingQueue_.size(), kMaxPerIteration);
+        packets.reserve(n);
+        for (size_t i = 0; i < n; i++) {
             packets.push_back(incomingQueue_.front());
             incomingQueue_.pop();
         }
+        more = !incomingQueue_.empty();
     }
     for (const auto& pkt : packets) {
         WgSlotPbuf* holder = nullptr;
@@ -301,6 +310,7 @@ void LwipRelay::processIncomingQueue() {
         }
         wg_netif_input_slot(&netif_, tunnel_, pkt.slot, pkt.data, pkt.len, holder);
     }
+    if (more) signalWake();
 }
 
 void LwipRelay::tick() {
