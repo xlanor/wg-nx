@@ -8,6 +8,7 @@
 #include <map>
 #include <vector>
 #include <queue>
+#include <array>
 #include <functional>
 
 extern "C" {
@@ -15,6 +16,7 @@ extern "C" {
 #include "lwip/udp.h"
 #include "lwip/netif.h"
 #include "wireguard.h"
+#include "wg_netif.h"
 }
 
 namespace wgnx {
@@ -45,8 +47,13 @@ public:
     uint16_t startTcpRelay(uint16_t targetPort, uint16_t localPort);
     uint16_t startUdpRelay(uint16_t targetPort, uint16_t localPort);
 
-    void handleIncomingPacket(const void* data, size_t len);
+    /* Zero-copy ingress entry. Takes ownership of `slot`; the LwipRelay will
+     * release it via the tunnel's pool once lwIP is done with the pbuf.
+     * Returns non-zero if ownership was taken, 0 if dropped (caller releases). */
+    int handleIncomingPacket(WgRecvSlot* slot, const void* data, size_t len);
     void tick();
+
+    static int onTunnelRecv(void* user, WgRecvSlot* slot, const void* data, size_t len);
 
     bool isRunning() const { return running_; }
 
@@ -104,8 +111,16 @@ private:
     std::map<int, std::shared_ptr<TcpConnection>> tcpConnections_;
     std::map<uint16_t, std::shared_ptr<UdpBinding>> udpBindings_;
 
-    std::queue<std::vector<uint8_t>> incomingQueue_;
+    struct IncomingSlot {
+        WgRecvSlot* slot;
+        const uint8_t* data;
+        size_t len;
+    };
+    std::queue<IncomingSlot> incomingQueue_;
     std::mutex queueMutex_;
+
+    static constexpr size_t kSlotHolderCount = 128; /* > WG pool size to absorb lwIP hold time */
+    std::array<WgSlotPbuf, kSlotHolderCount> slotHolders_;
 
     bool initialized_;
 };

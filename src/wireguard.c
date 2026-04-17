@@ -7,7 +7,57 @@
 
 #define WG_MAX_PACKET_SIZE 2048
 
-static uint8_t g_recv_packet[WG_MAX_PACKET_SIZE];
+_Static_assert(WG_MAX_PACKET_SIZE <= WG_RECV_SLOT_CAP, "slot capacity too small");
+
+int wg_recv_pool_init(WgRecvPool* pool) {
+    if (!pool) return -1;
+    pool->slots = calloc(WG_RECV_POOL_SIZE, sizeof(WgRecvSlot));
+    if (!pool->slots) return -1;
+    if (wg_mutex_init(&pool->free_mutex, false) != 0) {
+        free(pool->slots);
+        pool->slots = NULL;
+        return -1;
+    }
+    pool->free_head = NULL;
+    for (size_t i = 0; i < WG_RECV_POOL_SIZE; i++) {
+        pool->slots[i].next = pool->free_head;
+        pool->free_head = &pool->slots[i];
+    }
+    pool->initialized = true;
+    return 0;
+}
+
+void wg_recv_pool_destroy(WgRecvPool* pool) {
+    if (!pool || !pool->initialized) return;
+    wg_mutex_fini(&pool->free_mutex);
+    free(pool->slots);
+    pool->slots = NULL;
+    pool->free_head = NULL;
+    pool->initialized = false;
+}
+
+WgRecvSlot* wg_recv_pool_acquire(WgRecvPool* pool) {
+    if (!pool || !pool->initialized) return NULL;
+    wg_mutex_lock(&pool->free_mutex);
+    WgRecvSlot* slot = pool->free_head;
+    if (slot) pool->free_head = slot->next;
+    wg_mutex_unlock(&pool->free_mutex);
+    if (slot) slot->next = NULL;
+    return slot;
+}
+
+void wg_recv_pool_release(WgRecvPool* pool, WgRecvSlot* slot) {
+    if (!pool || !pool->initialized || !slot) return;
+    wg_mutex_lock(&pool->free_mutex);
+    slot->next = pool->free_head;
+    pool->free_head = slot;
+    wg_mutex_unlock(&pool->free_mutex);
+}
+
+void wg_recv_slot_release(WgTunnel* tun, WgRecvSlot* slot) {
+    if (!tun) return;
+    wg_recv_pool_release(&tun->recv_pool, slot);
+}
 
 #define WG_KEEPALIVE_DEFAULT 25
 #define WG_REKEY_CHECK_INTERVAL_MS 10000
@@ -17,20 +67,23 @@ static int wg_jitter_ms(void) {
 }
 
 static void (*wg_log_func)(const char* msg) = NULL;
+bool wg_log_enabled = false;
 
 void wg_set_log_callback(void (*func)(const char* msg)) {
     wg_log_func = func;
+    __atomic_store_n(&wg_log_enabled, func != NULL, __ATOMIC_RELEASE);
 }
 
-void wg_log(const char* fmt, ...) {
-    if (!wg_log_func)
+void wg_log_impl(const char* fmt, ...) {
+    void (*cb)(const char*) = wg_log_func;
+    if (!cb)
         return;
     char buf[256];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    wg_log_func(buf);
+    cb(buf);
 }
 
 uint32_t wg_random_index(void);
@@ -72,6 +125,13 @@ WgTunnel* wg_init(const WgConfig* config) {
     }
 
     if (wg_stop_cond_init(&tun->stop_cond) != 0) {
+        wg_mutex_fini(&tun->send_mutex);
+        free(tun);
+        return NULL;
+    }
+
+    if (wg_recv_pool_init(&tun->recv_pool) != 0) {
+        wg_stop_cond_fini(&tun->stop_cond);
         wg_mutex_fini(&tun->send_mutex);
         free(tun);
         return NULL;
@@ -312,16 +372,20 @@ static bool wg_needs_rekey(WgTunnel* tun) {
 static void* recv_thread_func(void* arg) {
     WgTunnel* tun = (WgTunnel*)arg;
     wg_thread_set_affinity(WG_THREAD_NAME_RECV);
-    uint8_t* packet = g_recv_packet;
     uint64_t total_recv = 0;
     uint64_t last_log = 0;
+    static uint8_t fallback_packet[WG_MAX_PACKET_SIZE];
 
     wg_log("recv thread started");
 
     while (!wg_stop_cond_check(&tun->stop_cond)) {
+        WgRecvSlot* slot = wg_recv_pool_acquire(&tun->recv_pool);
+        uint8_t* packet = slot ? slot->data : fallback_packet;
+
         int received = wg_socket_recv(tun, packet, WG_MAX_PACKET_SIZE, 100);
 
         if (received < 0) {
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             if (received == WG_ERR_TIMEOUT) {
                 uint64_t now = wg_time_now();
                 if (now - last_log > 5000000000ULL) {
@@ -338,6 +402,7 @@ static void* recv_thread_func(void* arg) {
 
         if ((size_t)received < sizeof(WgTransport) + WG_AEAD_TAG_LEN) {
             wg_log("recv: pkt too small (%d)", received);
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
@@ -365,6 +430,7 @@ static void* recv_thread_func(void* arg) {
             } else {
                 wg_log("recv: not transport (type=%d)", transport->type);
             }
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
@@ -383,6 +449,7 @@ static void* recv_thread_func(void* arg) {
                    transport->receiver_index, cur_idx,
                    tun->prev_session.valid, tun->prev_session.local_index,
                    tun->session.old_local_index);
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
@@ -393,6 +460,7 @@ static void* recv_thread_func(void* arg) {
                 crypto_wipe(&tun->prev_session, sizeof(tun->prev_session));
                 tun->prev_session.valid = false;
             }
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
@@ -401,17 +469,20 @@ static void* recv_thread_func(void* arg) {
 
         if (plaintext_len == 0) {
             sess->last_received = wg_time_now();
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
         int err = wg_aead_decrypt(transport->encrypted_data, sess->receiving_key, transport->counter, transport->encrypted_data, ciphertext_len, NULL, 0);
         if (err != 0) {
             wg_log("recv: decrypt failed (ctr=%llu)", (unsigned long long)transport->counter);
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
         if (!wg_counter_validate(&sess->replay, transport->counter)) {
             wg_log("recv: replay detected (ctr=%llu)", (unsigned long long)transport->counter);
+            if (slot) wg_recv_pool_release(&tun->recv_pool, slot);
             continue;
         }
 
@@ -422,8 +493,15 @@ static void* recv_thread_func(void* arg) {
         wg_update_endpoint_from_recv(tun);
         wg_mutex_unlock(&tun->send_mutex);
 
-        if (tun->recv_cb)
-            tun->recv_cb(tun->recv_cb_user, transport->encrypted_data, plaintext_len);
+        /* Hand plaintext to the consumer. If pool was exhausted (slot == NULL)
+         * or the consumer did not claim ownership, we drop the packet (for
+         * transport data — handshake/rekey state has already been mutated). */
+        if (tun->recv_cb && slot) {
+            int retained = tun->recv_cb(tun->recv_cb_user, slot, transport->encrypted_data, plaintext_len);
+            if (!retained) wg_recv_pool_release(&tun->recv_pool, slot);
+        } else if (slot) {
+            wg_recv_pool_release(&tun->recv_pool, slot);
+        }
     }
 
     wg_log("recv thread exiting, total=%llu", (unsigned long long)total_recv);
@@ -575,7 +653,7 @@ int wg_recv(WgTunnel* tun, void* buf, size_t len, int timeout_ms) {
     if (!tun || !tun->session.valid)
         return WG_ERR_NOT_CONNECTED;
 
-    uint8_t* packet = g_recv_packet;
+    uint8_t packet[WG_MAX_PACKET_SIZE];
 
     int received = wg_socket_recv(tun, packet, WG_MAX_PACKET_SIZE, timeout_ms);
     if (received < 0)
@@ -629,6 +707,7 @@ void wg_close(WgTunnel* tun) {
 
     wg_stop(tun);
     wg_socket_close(tun);
+    wg_recv_pool_destroy(&tun->recv_pool);
     wg_stop_cond_fini(&tun->stop_cond);
     wg_mutex_fini(&tun->send_mutex);
     crypto_wipe(tun->static_private, WG_KEY_LEN);

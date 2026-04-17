@@ -16,6 +16,8 @@
 #define PBUF_POOL_SIZE                  32
 #define PBUF_POOL_BUFSIZE               1600
 
+#define LWIP_SUPPORT_CUSTOM_PBUF        1
+
 #define LWIP_TCP                        1
 #define TCP_MSS                         1460
 #define TCP_SND_BUF                     (8 * TCP_MSS)

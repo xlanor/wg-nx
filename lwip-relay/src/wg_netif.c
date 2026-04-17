@@ -52,6 +52,45 @@ void wg_netif_input(struct netif *netif, const void *data, size_t len) {
     }
 }
 
+static void wg_slot_pbuf_free(struct pbuf *p) {
+    WgSlotPbuf *holder = (WgSlotPbuf *)p;
+    WgTunnel *tun = holder->tunnel;
+    WgRecvSlot *slot = holder->slot;
+    holder->in_use = 0;
+    holder->tunnel = NULL;
+    holder->slot = NULL;
+    if (tun && slot) {
+        wg_recv_slot_release(tun, slot);
+    }
+}
+
+void wg_netif_input_slot(struct netif *netif, WgTunnel *tunnel, WgRecvSlot *slot,
+                         const void *data, size_t len, WgSlotPbuf *holder) {
+    if (!netif || !tunnel || !slot || !data || !holder || len == 0) {
+        if (tunnel && slot) wg_recv_slot_release(tunnel, slot);
+        return;
+    }
+
+    holder->pc.custom_free_function = wg_slot_pbuf_free;
+    holder->tunnel = tunnel;
+    holder->slot = slot;
+    holder->in_use = 1;
+
+    struct pbuf *p = pbuf_alloced_custom(PBUF_RAW, (u16_t)len, PBUF_REF,
+                                         &holder->pc, (void *)data, (u16_t)len);
+    if (!p) {
+        holder->in_use = 0;
+        holder->tunnel = NULL;
+        holder->slot = NULL;
+        wg_recv_slot_release(tunnel, slot);
+        return;
+    }
+
+    if (netif->input(p, netif) != ERR_OK) {
+        pbuf_free(p);
+    }
+}
+
 void wg_netif_set_tunnel(struct netif *netif, WgTunnel *tunnel) {
     if (netif) {
         netif->state = tunnel;

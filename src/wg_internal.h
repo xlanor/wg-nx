@@ -21,6 +21,21 @@
 #define WG_COUNTER_WINDOW_SIZE   8192
 #define WG_REJECT_AFTER_MESSAGES (UINT64_MAX - WG_COUNTER_WINDOW_SIZE - 1)
 
+#define WG_RECV_SLOT_CAP   2048
+#define WG_RECV_POOL_SIZE  64
+
+struct WgRecvSlot {
+    struct WgRecvSlot* next;
+    uint8_t data[WG_RECV_SLOT_CAP];
+};
+
+typedef struct {
+    WgRecvSlot* slots;
+    WgRecvSlot* free_head;
+    WgMutex free_mutex;
+    bool initialized;
+} WgRecvPool;
+
 #define WG_COUNTER_WORDS (WG_COUNTER_WINDOW_SIZE / (sizeof(uint64_t) * 8))
 typedef struct {
     uint64_t counter;
@@ -135,7 +150,14 @@ struct WgTunnel {
 
     struct sockaddr_in recv_src;
     bool recv_src_valid;
+
+    WgRecvPool recv_pool;
 };
+
+int wg_recv_pool_init(WgRecvPool* pool);
+void wg_recv_pool_destroy(WgRecvPool* pool);
+WgRecvSlot* wg_recv_pool_acquire(WgRecvPool* pool);
+void wg_recv_pool_release(WgRecvPool* pool, WgRecvSlot* slot);
 
 void wg_hash(uint8_t out[WG_HASH_LEN], const void* data, size_t len);
 void wg_hash2(uint8_t out[WG_HASH_LEN], const void* a, size_t a_len, const void* b, size_t b_len);
@@ -169,6 +191,8 @@ void wg_update_endpoint_from_recv(WgTunnel* tun);
 uint32_t wg_random_index(void);
 int wg_resolve_endpoint(WgTunnel* tun, const char* host, uint16_t port);
 
-void wg_log(const char* fmt, ...);
+extern bool wg_log_enabled;
+void wg_log_impl(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#define wg_log(...) do { if (__builtin_expect(wg_log_enabled, 0)) wg_log_impl(__VA_ARGS__); } while (0)
 
 #endif

@@ -27,6 +27,11 @@ LwipRelay::LwipRelay(WgTunnel* tunnel, const LwipRelayConfig& config)
     memset(&netif_, 0, sizeof(netif_));
     memset(&tunnelAddr_, 0, sizeof(tunnelAddr_));
     memset(&targetAddr_, 0, sizeof(targetAddr_));
+    for (auto& h : slotHolders_) {
+        h.in_use = 0;
+        h.tunnel = nullptr;
+        h.slot = nullptr;
+    }
 }
 
 LwipRelay::~LwipRelay() {
@@ -83,6 +88,7 @@ bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) 
     log(LogLevel::Info, "LwipRelay: netif created with IP %s", tunnelIp.c_str());
 
     running_ = true;
+    wg_set_recv_callback(tunnel_, &LwipRelay::onTunnelRecv, this);
     loopThread_ = std::thread(&LwipRelay::runLoop, this);
 
     return true;
@@ -91,8 +97,25 @@ bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) 
 void LwipRelay::stop() {
     running_ = false;
 
+    /* Unregister recv callback before joining so no new slots enter the queue. */
+    if (tunnel_) {
+        wg_set_recv_callback(tunnel_, nullptr, nullptr);
+    }
+
     if (loopThread_.joinable()) {
         loopThread_.join();
+    }
+
+    /* Drain any slots still in the queue that never reached lwIP. */
+    {
+        std::lock_guard<std::mutex> qlock(queueMutex_);
+        while (!incomingQueue_.empty()) {
+            auto& front = incomingQueue_.front();
+            if (tunnel_ && front.slot) {
+                wg_recv_slot_release(tunnel_, front.slot);
+            }
+            incomingQueue_.pop();
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -189,22 +212,39 @@ uint16_t LwipRelay::startUdpRelay(uint16_t targetPort, uint16_t localPort) {
     return localPort;
 }
 
-void LwipRelay::handleIncomingPacket(const void* data, size_t len) {
+int LwipRelay::onTunnelRecv(void* user, WgRecvSlot* slot, const void* data, size_t len) {
+    return static_cast<LwipRelay*>(user)->handleIncomingPacket(slot, data, len);
+}
+
+int LwipRelay::handleIncomingPacket(WgRecvSlot* slot, const void* data, size_t len) {
+    if (!running_ || !slot || !data || len == 0) {
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(queueMutex_);
-    incomingQueue_.emplace(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + len);
+    incomingQueue_.push({slot, static_cast<const uint8_t*>(data), len});
+    return 1;
 }
 
 void LwipRelay::processIncomingQueue() {
-    std::vector<std::vector<uint8_t>> packets;
+    std::vector<IncomingSlot> packets;
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
         while (!incomingQueue_.empty()) {
-            packets.push_back(std::move(incomingQueue_.front()));
+            packets.push_back(incomingQueue_.front());
             incomingQueue_.pop();
         }
     }
     for (const auto& pkt : packets) {
-        wg_netif_input(&netif_, pkt.data(), pkt.size());
+        WgSlotPbuf* holder = nullptr;
+        for (auto& h : slotHolders_) {
+            if (!h.in_use) { holder = &h; break; }
+        }
+        if (!holder) {
+            /* No holder free — lwIP is holding too many. Drop and release slot. */
+            wg_recv_slot_release(tunnel_, pkt.slot);
+            continue;
+        }
+        wg_netif_input_slot(&netif_, tunnel_, pkt.slot, pkt.data, pkt.len, holder);
     }
 }
 
