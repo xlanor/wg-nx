@@ -87,11 +87,56 @@ bool LwipRelay::start(const std::string& tunnelIp, const std::string& targetIp) 
 
     log(LogLevel::Info, "LwipRelay: netif created with IP %s", tunnelIp.c_str());
 
+    /* Self-pipe via a connected loopback UDP pair — libnx's BSD sockets
+     * don't implement AF_UNIX, so socketpair() is unavailable here. */
+    wakeFd_[0] = socket(AF_INET, SOCK_DGRAM, 0);
+    wakeFd_[1] = socket(AF_INET, SOCK_DGRAM, 0);
+    if (wakeFd_[0] < 0 || wakeFd_[1] < 0) {
+        log(LogLevel::Error, "LwipRelay: wake socket create failed");
+        if (wakeFd_[0] >= 0) { close(wakeFd_[0]); wakeFd_[0] = -1; }
+        if (wakeFd_[1] >= 0) { close(wakeFd_[1]); wakeFd_[1] = -1; }
+        netif_set_down(&netif_);
+        netif_remove(&netif_);
+        return false;
+    }
+    sockaddr_in wakeAddr{};
+    wakeAddr.sin_family = AF_INET;
+    wakeAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    wakeAddr.sin_port = 0;
+    if (bind(wakeFd_[0], (sockaddr*)&wakeAddr, sizeof(wakeAddr)) < 0) {
+        log(LogLevel::Error, "LwipRelay: wake bind failed");
+        close(wakeFd_[0]); wakeFd_[0] = -1;
+        close(wakeFd_[1]); wakeFd_[1] = -1;
+        netif_set_down(&netif_);
+        netif_remove(&netif_);
+        return false;
+    }
+    socklen_t wakeLen = sizeof(wakeAddr);
+    if (getsockname(wakeFd_[0], (sockaddr*)&wakeAddr, &wakeLen) < 0 ||
+        connect(wakeFd_[1], (sockaddr*)&wakeAddr, sizeof(wakeAddr)) < 0) {
+        log(LogLevel::Error, "LwipRelay: wake connect failed");
+        close(wakeFd_[0]); wakeFd_[0] = -1;
+        close(wakeFd_[1]); wakeFd_[1] = -1;
+        netif_set_down(&netif_);
+        netif_remove(&netif_);
+        return false;
+    }
+    fcntl(wakeFd_[0], F_SETFL, fcntl(wakeFd_[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(wakeFd_[1], F_SETFL, fcntl(wakeFd_[1], F_GETFL, 0) | O_NONBLOCK);
+
+    pollFds_.reserve(32);
+
     running_ = true;
     wg_set_recv_callback(tunnel_, &LwipRelay::onTunnelRecv, this);
     loopThread_ = std::thread(&LwipRelay::runLoop, this);
 
     return true;
+}
+
+void LwipRelay::signalWake() {
+    if (wakeFd_[1] < 0) return;
+    char c = 1;
+    (void)write(wakeFd_[1], &c, 1);
 }
 
 void LwipRelay::stop() {
@@ -102,9 +147,14 @@ void LwipRelay::stop() {
         wg_set_recv_callback(tunnel_, nullptr, nullptr);
     }
 
+    signalWake();  /* break the blocking poll in runLoop */
+
     if (loopThread_.joinable()) {
         loopThread_.join();
     }
+
+    if (wakeFd_[0] >= 0) { close(wakeFd_[0]); wakeFd_[0] = -1; }
+    if (wakeFd_[1] >= 0) { close(wakeFd_[1]); wakeFd_[1] = -1; }
 
     /* Drain any slots still in the queue that never reached lwIP. */
     {
@@ -167,6 +217,7 @@ uint16_t LwipRelay::startTcpRelay(uint16_t targetPort, uint16_t localPort) {
 
     tcpListeners_[localPort] = sock;
     log(LogLevel::Info, "LwipRelay: TCP listener on port %u -> %u", localPort, targetPort);
+    signalWake();
     return localPort;
 }
 
@@ -209,6 +260,7 @@ uint16_t LwipRelay::startUdpRelay(uint16_t targetPort, uint16_t localPort) {
     udpBindings_[localPort] = binding;
 
     log(LogLevel::Info, "LwipRelay: UDP socket on port %u -> %u", localPort, targetPort);
+    signalWake();
     return localPort;
 }
 
@@ -220,8 +272,11 @@ int LwipRelay::handleIncomingPacket(WgRecvSlot* slot, const void* data, size_t l
     if (!running_ || !slot || !data || len == 0) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(queueMutex_);
-    incomingQueue_.push({slot, static_cast<const uint8_t*>(data), len});
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        incomingQueue_.push({slot, static_cast<const uint8_t*>(data), len});
+    }
+    signalWake();
     return 1;
 }
 
@@ -259,7 +314,40 @@ void LwipRelay::runLoop() {
 
     log(LogLevel::Info, "LwipRelay: loop started");
 
+    /* Event-driven: block in a single poll() watching the wake pipe and all
+     * managed sockets. The 50ms timeout bounds lwIP timer accuracy, which is
+     * well within TCP's 500ms retransmit floor. */
+    constexpr int kPollTimeoutMs = 50;
+
     while (running_) {
+        pollFds_.clear();
+        pollFds_.push_back({wakeFd_[0], POLLIN, 0});
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& pair : tcpListeners_) {
+                pollFds_.push_back({pair.second, POLLIN, 0});
+            }
+            for (auto& pair : tcpConnections_) {
+                if (pair.second->connected) {
+                    pollFds_.push_back({pair.first, POLLIN, 0});
+                }
+            }
+            for (auto& pair : udpBindings_) {
+                pollFds_.push_back({pair.second->localSock, POLLIN, 0});
+            }
+        }
+
+        poll(pollFds_.data(), pollFds_.size(), kPollTimeoutMs);
+
+        if (!running_) break;
+
+        /* Drain any queued wake bytes. */
+        if (pollFds_[0].revents & POLLIN) {
+            char buf[64];
+            while (read(wakeFd_[0], buf, sizeof(buf)) > 0) {}
+        }
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
             processIncomingQueue();
@@ -268,7 +356,6 @@ void LwipRelay::runLoop() {
             pollUdpSockets();
             sys_check_timeouts();
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     log(LogLevel::Info, "LwipRelay: loop ended");

@@ -17,6 +17,7 @@ extern "C" {
 #include "lwip/netif.h"
 #include "wireguard.h"
 #include "wg_netif.h"
+#include <poll.h>
 }
 
 namespace wgnx {
@@ -82,6 +83,7 @@ private:
     void pollTcpListeners();
     void pollUdpSockets();
     void pollTcpConnections();
+    void signalWake();
 
     int createTcpListener(uint16_t port);
     int createUdpSocket(uint16_t port);
@@ -121,6 +123,9 @@ private:
 
     static constexpr size_t kSlotHolderCount = 128; /* > WG pool size to absorb lwIP hold time */
     std::array<WgSlotPbuf, kSlotHolderCount> slotHolders_;
+
+    int wakeFd_[2] = {-1, -1};
+    std::vector<pollfd> pollFds_;
 
     bool initialized_;
 };
